@@ -32,7 +32,8 @@ MODE_CHAR_UUID = "b8b7e002-7a6b-4f4f-9a8b-11c0ffee0001"
 # ---- 配置 ----
 
 POLL_INTERVAL = 0.15         # 状态轮询间隔（秒）— 高频保证 alarm→busy 低延迟
-RECONNECT_DELAY = 2.0        # BLE 断线重连间隔
+RECONNECT_DELAY_MIN = 2.0    # BLE 断线重连起始间隔
+RECONNECT_DELAY_MAX = 60.0   # BLE 断线重连最大间隔（指数退避上限）
 BLE_TIMEOUT = 8.0            # 单次 BLE 操作超时
 
 DEBOUNCE_MS = {
@@ -150,22 +151,51 @@ class PersistentBLE:
         return await self._do_connect()
 
     async def _do_connect(self) -> bool:
-        """建立 BleakClient 连接。"""
-        try:
-            self.client = BleakClient(
-                self.address,
-                timeout=BLE_TIMEOUT,
-                disconnected_callback=self._on_disconnect,
-            )
-            await asyncio.wait_for(self.client.connect(), timeout=BLE_TIMEOUT)
-            if self.client.is_connected:
+        """建立 BleakClient 连接，验证 GATT 特征值可用。"""
+        for attempt in range(3):
+            try:
+                self.client = BleakClient(
+                    self.address,
+                    timeout=BLE_TIMEOUT,
+                    disconnected_callback=self._on_disconnect,
+                )
+                await asyncio.wait_for(self.client.connect(), timeout=BLE_TIMEOUT)
+                if not self.client.is_connected:
+                    continue
+
+                # 等待 GATT 服务就绪
+                await asyncio.sleep(0.2)
+
+                # 验证特征值存在（Windows BLE 缓存可能过期，需要重试）
+                try:
+                    svc = self.client.services.get_service(
+                        "b8b7e001-7a6b-4f4f-9a8b-11c0ffee0001"
+                    )
+                    if svc is None or svc.get_characteristic(MODE_CHAR_UUID) is None:
+                        if attempt < 2:
+                            log(f"BLE GATT not ready, retry {attempt+1}/3")
+                            await self.client.disconnect()
+                            await asyncio.sleep(0.5)
+                            continue
+                except Exception:
+                    if attempt < 2:
+                        log(f"BLE service discovery error, retry {attempt+1}/3")
+                        await self.client.disconnect()
+                        await asyncio.sleep(0.5)
+                        continue
+
                 self.connected = True
                 log(f"BLE connected: {self.address}")
                 return True
-        except asyncio.TimeoutError:
-            log("BLE connect timeout")
-        except Exception as e:
-            log(f"BLE connect error: {e}")
+
+            except asyncio.TimeoutError:
+                log("BLE connect timeout")
+            except Exception as e:
+                log(f"BLE connect error: {e}")
+
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+
         self.connected = False
         return False
 
@@ -190,6 +220,10 @@ class PersistentBLE:
             log(f"BLE write timeout: {mode}")
         except Exception as e:
             log(f"BLE write error: {mode} | {e}")
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
         self.connected = False
         return False
 
@@ -218,6 +252,8 @@ async def daemon_loop():
     last_sent_ms = 0
     last_sent_mode = ""
     reconnect_cooldown = 0
+    reconnect_backoff = RECONNECT_DELAY_MIN   # 指数退避当前值
+    consecutive_failures = 0
 
     while True:
         try:
@@ -226,13 +262,22 @@ async def daemon_loop():
             # ---- BLE 连接管理 ----
             if not ble.connected:
                 if now_ms >= reconnect_cooldown:
-                    reconnect_cooldown = now_ms + int(RECONNECT_DELAY * 1000)
+                    reconnect_backoff = min(
+                        RECONNECT_DELAY_MIN * (2 ** consecutive_failures),
+                        RECONNECT_DELAY_MAX,
+                    )
+                    reconnect_cooldown = now_ms + int(reconnect_backoff * 1000)
                     if ble.address:
-                        log(f"Reconnecting to {ble.address} ...")
-                        await ble.connect_cached(ble.address)
+                        log(f"Reconnecting to {ble.address} (backoff={reconnect_backoff:.0f}s, fails={consecutive_failures}) ...")
+                        success = await ble.connect_cached(ble.address)
                     else:
-                        log("Scanning for device ...")
-                        await ble.connect()
+                        log(f"Scanning for device (backoff={reconnect_backoff:.0f}s) ...")
+                        success = await ble.connect()
+                    if success:
+                        consecutive_failures = 0
+                        reconnect_backoff = RECONNECT_DELAY_MIN
+                    else:
+                        consecutive_failures += 1
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
@@ -259,8 +304,12 @@ async def daemon_loop():
                         last_sent_ms = int(time.time() * 1000)
                         last_sent_mode = mode
                         log(f"BLE OK: {mode}")
+                        # 写入成功说明连接健康，重置退避
+                        consecutive_failures = 0
+                        reconnect_backoff = RECONNECT_DELAY_MIN
                     else:
                         log(f"BLE fail: {mode}, will reconnect")
+                        consecutive_failures += 1
                 else:
                     remaining = (debounce - elapsed) / 1000
                     if remaining > 0.5:  # 只记录明显的 debounce 阻塞

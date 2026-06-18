@@ -1,4 +1,28 @@
-# Changelog — v2.4
+# Changelog — v2.5
+
+## [2.5] — 2026-06-18
+
+### Added
+- **BLE 指数退避重连**：断线重连从固定 2s 间隔升级为指数退避策略。
+  - `RECONNECT_DELAY_MIN = 2s` → 每次失败翻倍 → `RECONNECT_DELAY_MAX = 60s`
+  - 连接成功立即重置为 `RECONNECT_DELAY_MIN`
+  - 写入失败同样计入失败计数，触发退避增长
+  - 避免 BLE 信号不稳定时的重连风暴，减少日志噪音和资源消耗
+- **BLE GATT 验证**：`_do_connect()` 连接后验证 Service UUID (`b8b7e001-...`) 和 Mode Characteristic (`b8b7e002-...`) 存在，最多 3 次重试。
+  - 解决 Windows BLE 缓存过期导致连接成功但 GATT 服务不可用的问题
+  - 每次重试前断开旧连接，间隔 0.5s
+
+### Changed
+- `ble_daemon.py`：`RECONNECT_DELAY` 拆分为 `RECONNECT_DELAY_MIN` / `RECONNECT_DELAY_MAX`，主循环引入 `consecutive_failures` + `reconnect_backoff` 追踪。
+
+### Fixed
+- 修复 BLE 断线重连时因 Windows 缓存返回过期 GATT 句柄导致写入失败的问题。
+
+---
+
+> 上一版本 [2.4] 主要新增了灯效映射同步（桌面圆点与 BLE 物理灯统一 5 模式动画）、最小保持时间（MIN_HOLD_MS）防丢帧。
+
+---
 
 ## [2.4] — 2026-06-17
 
